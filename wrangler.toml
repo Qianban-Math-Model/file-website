@@ -1,11 +1,11 @@
-name = "lms-backup-website"
+name = "mathmodel-file-website"
 main = "src/index.js"
 compatibility_date = "2026-02-27"
 
 [[r2_buckets]]
 binding = "R2_BUCKET"
-bucket_name = "lms-server"
+bucket_name = "math-model"
 
 [vars]
-R2_BUCKET_NAME = "lms-server"
+R2_BUCKET_NAME = "math-model"
 R2_PRESIGN_EXPIRES = "300"
