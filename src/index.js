@@ -68,6 +68,79 @@ function parsePresignExpiry(rawValue) {
   return Math.max(1, Math.min(604800, parsed));
 }
 
+function json(data, init = {}) {
+  const headers = new Headers(init.headers);
+  if (!headers.has("content-type")) {
+    headers.set("content-type", "application/json; charset=utf-8");
+  }
+  return new Response(JSON.stringify(data), { ...init, headers });
+}
+
+function getPasswordSha256(env) {
+  return String(env.PASSWORD_SHA256 || "")
+    .trim()
+    .toLowerCase();
+}
+
+async function verifyPassword(request, env) {
+  const expected = getPasswordSha256(env);
+  if (!expected) return true;
+
+  let provided = request.headers.get("x-access-password") || "";
+  if (!provided) {
+    const url = new URL(request.url);
+    provided = url.searchParams.get("password") || "";
+  }
+  if (!provided && request.method === "POST") {
+    const formData = await request.clone().formData();
+    provided = String(formData.get("password") || "");
+  }
+  if (!provided) return false;
+
+  return (await sha256Hex(provided)) === expected;
+}
+
+async function listDirectory(bucket, prefix) {
+  let cursor;
+  const folders = new Set();
+  const files = [];
+
+  do {
+    const page = await bucket.list({
+      prefix,
+      delimiter: "/",
+      cursor,
+    });
+
+    for (const folderPrefix of page.delimitedPrefixes || []) {
+      folders.add(folderPrefix);
+    }
+
+    for (const obj of page.objects) {
+      if (obj.key !== prefix) files.push(obj.key);
+    }
+
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  return {
+    folders: Array.from(folders)
+      .sort((a, b) => a.localeCompare(b))
+      .map((folderPrefix) => ({
+        key: folderPrefix,
+        name: `${nameFromKey(folderPrefix, prefix).replace(/\/$/, "")}/`,
+      })),
+    files: files
+      .sort((a, b) => a.localeCompare(b))
+      .map((key) => ({
+        key,
+        name: nameFromKey(key, prefix),
+      })),
+    parent: parentPrefix(prefix),
+    prefix,
+  };
+}
+
 async function hmacSha256(key, data) {
   const keyData =
     typeof key === "string" ? new TextEncoder().encode(key) : key.buffer;
@@ -147,8 +220,25 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/download") {
-      const key = url.searchParams.get("key");
+    if (url.pathname === "/api/list") {
+      if (!(await verifyPassword(request, env))) {
+        return json({ error: "unauthorized" }, { status: 401 });
+      }
+
+      const prefix = normalizePrefix(url.searchParams.get("path") || "");
+      return json(await listDirectory(env.R2_BUCKET, prefix));
+    }
+
+    if (url.pathname === "/api/download") {
+      if (!(await verifyPassword(request, env))) {
+        return new Response("unauthorized", { status: 401 });
+      }
+
+      let key = url.searchParams.get("key");
+      if (!key && request.method === "POST") {
+        const formData = await request.formData();
+        key = String(formData.get("key") || "");
+      }
       if (!key) return new Response("missing key", { status: 400 });
 
       const r2AccountId = String(env.R2_ACCOUNT_ID || "").trim();
@@ -191,67 +281,187 @@ export default {
       return new Response("not found", { status: 404 });
     }
 
-    const prefix = normalizePrefix(url.searchParams.get("path") || "");
-    let cursor;
-    const folders = new Set();
-    const files = [];
+    const html = `<!doctype html>
+<meta charset="utf-8">
+<title>File Index</title>
+<h3 id="heading">Locked</h3>
+<div id="note">Refresh clears the password.</div>
+<form id="auth-form">
+  <input id="password-input" type="password" placeholder="Password" autocomplete="off" required>
+  <button type="submit">OK</button>
+</form>
+<div id="toolbar" style="display:none">
+  <a href="#" id="up-link">..</a>
+  <button id="clear-button" type="button">clear password</button>
+</div>
+<div id="status"></div>
+<div id="list"></div>
+<script>
+    let sessionPassword = "";
+    let currentPrefix = "";
+    let currentParent = "";
 
-    do {
-      const page = await env.R2_BUCKET.list({
-        prefix,
-        delimiter: "/",
-        cursor,
+    const authForm = document.getElementById("auth-form");
+    const passwordInput = document.getElementById("password-input");
+    const toolbar = document.getElementById("toolbar");
+    const upLink = document.getElementById("up-link");
+    const clearButton = document.getElementById("clear-button");
+    const heading = document.getElementById("heading");
+    const statusEl = document.getElementById("status");
+    const listEl = document.getElementById("list");
+
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.style.color = isError ? "red" : "";
+    }
+
+    function resetSession(message) {
+      sessionPassword = "";
+      currentPrefix = "";
+      currentParent = "";
+      authForm.style.display = "";
+      toolbar.style.display = "none";
+      listEl.innerHTML = "";
+      heading.textContent = "Locked";
+      passwordInput.value = "";
+      setStatus(message || "Password required");
+    }
+
+    async function fetchWithPassword(pathname, params) {
+      const url = new URL(pathname, window.location.origin);
+      if (params) {
+        for (const [key, value] of Object.entries(params)) {
+          url.searchParams.set(key, value);
+        }
+      }
+
+      return fetch(url, {
+        headers: {
+          "x-access-password": sessionPassword,
+        },
       });
+    }
 
-      for (const folderPrefix of page.delimitedPrefixes || []) {
-        folders.add(folderPrefix);
+    function renderList(data) {
+      currentPrefix = data.prefix || "";
+      currentParent = data.parent || "";
+      heading.textContent = "Index of /" + currentPrefix;
+      toolbar.style.display = "";
+      upLink.style.display = currentPrefix ? "" : "none";
+      listEl.innerHTML = "";
+
+      const entries = [];
+      for (const folder of data.folders) {
+        entries.push({
+          name: folder.name,
+          href: "/?path=" + encodeURIComponent(folder.key),
+          onClick: () => loadDirectory(folder.key),
+        });
       }
 
-      for (const obj of page.objects) {
-        if (obj.key !== prefix) files.push(obj.key);
+      for (const file of data.files) {
+        entries.push({
+          name: file.name,
+          href: "/api/download?key=" + encodeURIComponent(file.key),
+          onClick: () => downloadFile(file.key),
+        });
       }
 
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
+      if (!entries.length) {
+        listEl.innerHTML = '<div class="empty">(empty)</div>';
+        return;
+      }
 
-    const folderItems = Array.from(folders).sort((a, b) => a.localeCompare(b));
-    const fileItems = files.sort((a, b) => a.localeCompare(b));
-    const parent = parentPrefix(prefix);
-    const lines = [];
-
-    lines.push("<!doctype html>");
-    lines.push('<meta charset="utf-8">');
-    lines.push(`<h3>Index of /${escapeHtml(prefix)}</h3>`);
-
-    if (prefix) {
-      lines.push(
-        `<div><a href="/?path=${encodeURIComponent(parent)}">..</a></div>`,
-      );
+      for (const entry of entries) {
+        const div = document.createElement("div");
+        const link = document.createElement("a");
+        link.href = entry.href;
+        link.textContent = entry.name;
+        link.addEventListener("click", (event) => {
+          event.preventDefault();
+          entry.onClick();
+        });
+        div.appendChild(link);
+        listEl.appendChild(div);
+      }
     }
 
-    for (const folderPrefix of folderItems) {
-      const folderName = `${nameFromKey(folderPrefix, prefix).replace(/\/$/, "")}/`;
-      lines.push(
-        `<div><a href="/?path=${encodeURIComponent(folderPrefix)}">${escapeHtml(
-          folderName,
-        )}</a></div>`,
-      );
+    async function loadDirectory(prefix = "") {
+      if (!sessionPassword) {
+        resetSession("Password required");
+        return;
+      }
+
+      setStatus("Loading...");
+      const response = await fetchWithPassword("/api/list", { path: prefix });
+      if (response.status === 401) {
+        resetSession("Password incorrect or expired");
+        return;
+      }
+      if (!response.ok) {
+        setStatus("Failed to load directory", true);
+        return;
+      }
+
+      const data = await response.json();
+      renderList(data);
+      setStatus("");
+      const nextUrl = prefix ? "/?path=" + encodeURIComponent(prefix) : "/";
+      window.history.replaceState({ prefix }, "", nextUrl);
     }
 
-    for (const key of fileItems) {
-      const fileName = nameFromKey(key, prefix);
-      lines.push(
-        `<div><a href="/download?key=${encodeURIComponent(key)}">${escapeHtml(
-          fileName,
-        )}</a></div>`,
-      );
+    async function downloadFile(key) {
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = "/api/download";
+      form.target = "_blank";
+      form.style.display = "none";
+
+      const keyInput = document.createElement("input");
+      keyInput.type = "hidden";
+      keyInput.name = "key";
+      keyInput.value = key;
+      form.appendChild(keyInput);
+
+      const passwordField = document.createElement("input");
+      passwordField.type = "hidden";
+      passwordField.name = "password";
+      passwordField.value = sessionPassword;
+      form.appendChild(passwordField);
+
+      document.body.appendChild(form);
+      form.submit();
+      form.remove();
+      setStatus("");
     }
 
-    if (!folderItems.length && !fileItems.length) {
-      lines.push("<div>(empty)</div>");
-    }
+    authForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      sessionPassword = passwordInput.value;
+      authForm.style.display = "none";
+      await loadDirectory(new URL(window.location.href).searchParams.get("path") || "");
+    });
 
-    return new Response(lines.join("\n"), {
+    upLink.addEventListener("click", (event) => {
+      event.preventDefault();
+      if (currentPrefix) loadDirectory(currentParent);
+    });
+
+    clearButton.addEventListener("click", () => {
+      resetSession("Password cleared");
+    });
+
+    window.addEventListener("popstate", () => {
+      if (!sessionPassword) return;
+      loadDirectory(new URL(window.location.href).searchParams.get("path") || "");
+    });
+
+    resetSession("Password required");
+  </script>
+</body>
+</html>`;
+
+    return new Response(html, {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
   },
