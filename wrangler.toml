@@ -1,4 +1,4 @@
-name = "mathmodel-file-website"
+name = "file-website"
 main = "src/index.js"
 compatibility_date = "2026-02-27"
 
