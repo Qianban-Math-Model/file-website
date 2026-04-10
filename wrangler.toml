@@ -9,3 +9,11 @@ bucket_name = "math-model"
 [vars]
 R2_BUCKET_NAME = "math-model"
 R2_PRESIGN_EXPIRES = "300"
+
+[observability]
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
